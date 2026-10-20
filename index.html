@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interaktive Eigene Karte (mit Entfernungsmesser)</title>
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: sans-serif; }
+        body { display: flex; flex-direction: column; height: 100vh; }
+
+        /* Suchleiste & Toolbar Header */
+        #search-container {
+            padding: 10px 15px;
+            background: #1e293b;
+            color: white;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            z-index: 1000;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            flex-wrap: wrap;
+        }
+
+        #search-input, .mode-select {
+            padding: 8px 12px;
+            border-radius: 4px;
+            border: 1px solid #cbd5e1;
+            font-size: 14px;
+        }
+
+        #search-input { width: 180px; }
+        .mode-select { background: white; color: #0f172a; font-weight: bold; cursor: pointer; }
+
+        .btn {
+            padding: 8px 14px;
+            background: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .btn:hover { background: #2563eb; }
+        .btn-danger { background: #ef4444; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-warning { background: #f59e0b; }
+        .btn-warning:hover { background: #d97706; }
+
+        /* Anzeige für Distanz */
+        #measure-box {
+            background: #334155;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+            color: #38bdf8;
+            display: none;
+        }
+
+        /* Karten-Container */
+        #map { flex: 1; width: 100%; background: #0f172a; }
+
+        /* Custom Popup Styles */
+        .popup-content { display: flex; flex-direction: column; gap: 8px; min-width: 200px; }
+        .popup-content h3 { margin: 0; font-size: 16px; color: #0f172a; }
+        .popup-content label { font-size: 12px; color: #64748b; margin-bottom: -4px; }
+        .popup-content input, .popup-content textarea {
+            padding: 6px;
+            border: 1px solid #cbd5e1;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .popup-actions { display: flex; gap: 6px; margin-top: 4px; }
+        .save-btn {
+            flex: 1;
+            padding: 6px;
+            background: #10b981;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .save-btn:hover { background: #059669; }
+        .delete-btn {
+            padding: 6px 10px;
+            background: #ef4444;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .delete-btn:hover { background: #dc2626; }
+
+        .hint {
+            font-size: 12px;
+            color: #94a3b8;
+            margin-left: auto;
+        }
+
+        /* Orte im Mess-Modus unklickbar machen */
+        #map.measuring-mode .leaflet-marker-pane * {
+            pointer-events: none !important;
+        }
+    </style>
+</head>
+<body>
+
+<div id="search-container">
+    <!-- Modus Auswahl -->
+    <label for="mode-select"><strong>Modus:</strong></label>
+    <select id="mode-select" class="mode-select" onchange="switchMode(this.value)">
+        <option value="default">Default (Navigieren)</option>
+        <option value="ort">Ort hinzufügen</option>
+        <option value="entfernung">Entfernung messen</option>
+    </select>
+
+    <!-- Entfernungsmesser Controls (Standardmäßig versteckt) -->
+    <div id="measure-box">
+        Strecke: <strong id="dist-mi">0</strong> mi / <strong id="dist-km">0</strong> km
+    </div>
+    <button id="clear-measure-btn" class="btn btn-warning" style="display:none;" onclick="clearMeasurement()">Linie löschen</button>
+
+    <!-- Suche & Zurücksetzen -->
+    <label for="search-input" style="margin-left: 10px;">Suche:</label>
+    <input type="text" id="search-input" list="cities-list" placeholder="z.B. Sonnenhain..." onclick="prepareSearch(this)" onfocus="prepareSearch(this)" />
+    <datalist id="cities-list"></datalist>
+    <button class="btn" onclick="searchLocation()">Anspringen</button>
+
+</div>
+
+<div id="map"></div>
+
+<!-- Leaflet JS -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+    // =========================================================================
+    // KALIBRIERUNG DEINER KARTE
+    // =========================================================================
+    // Wie viele Bild-Pixel entsprechen 1 Meile auf deiner Karte?
+    // Beispiel: Wenn ein 100 Pixel langer Abschnitt auf deiner Legende 50 Meilen entspricht,
+    // rechne 100 / 50 = 2 Pixel pro Meile. Pass diesen Wert nach deiner Legende an!
+    const PIXELS_PER_MILE = 0.756;
+    const MILES_TO_KM = 1.60934;
+    // =========================================================================
+
+    const STORAGE_KEY = 'my_custom_map_locations';
+    const defaultLocations = [];
+
+    // System-Variablen
+    let currentMode = 'default';
+    let measurePoints = [];
+    let measurePolyline = null;
+    let measureMarkers = [];
+
+    // 1. Daten aus LocalStorage laden
+    function loadLocations() {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+            try { return JSON.parse(saved); }
+            catch (e) { console.error("Fehler beim Laden aus LocalStorage", e); }
+        }
+        return [...defaultLocations];
+    }
+
+    function saveLocationsToStorage() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(locations));
+    }
+
+    let locations = loadLocations();
+    const markers = {};
+
+    // 2. Karteneinstellungen für Bild-Nutzung (L.CRS.Simple)
+    const map = L.map('map', {
+        crs: L.CRS.Simple,
+        minZoom: -4,
+        maxZoom: 2
+    });
+
+    const imgWidth = 9800;
+    const imgHeight = 6798;
+    const bounds = [[0, 0], [imgHeight, imgWidth]];
+
+    const imageUrl = 'Toril.jpg';
+    L.imageOverlay(imageUrl, bounds).addTo(map);
+    map.fitBounds(bounds);
+
+    // 3. Render-Funktionen Orte
+    const datalist = document.getElementById('cities-list');
+
+    function clearMap() {
+        Object.keys(markers).forEach(key => {
+            map.removeLayer(markers[key].marker);
+            delete markers[key];
+        });
+        datalist.innerHTML = '';
+    }
+
+    function addSingleMarker(loc) {
+        const option = document.createElement('option');
+        option.value = loc.name;
+        datalist.appendChild(option);
+
+        const marker = L.marker(loc.coords).addTo(map);
+
+        const content = document.createElement('div');
+        content.className = 'popup-content';
+        content.innerHTML = `
+        <h3>${loc.name}</h3>
+        <label>Datum:</label>
+        <input type="date" id="date-${loc.id}" value="${loc.date || ''}">
+        <label>Info:</label>
+        <textarea id="info-${loc.id}" rows="2">${loc.info || ''}</textarea>
+        <div class="popup-actions">
+          <button class="save-btn" onclick="saveData(${loc.id})">Speichern</button>
+          <button class="delete-btn" onclick="deleteLocation(${loc.id})">Löschen</button>
+        </div>
+      `;
+        marker.bindPopup(content);
+
+        markers[loc.name.toLowerCase()] = { marker, data: loc };
+    }
+
+    function renderAll() {
+        clearMap();
+        locations.forEach(addSingleMarker);
+    }
+
+    // 4. Modus-Umschaltung
+    function switchMode(newMode) {
+        currentMode = newMode;
+        const measureBox = document.getElementById('measure-box');
+        const clearBtn = document.getElementById('clear-measure-btn');
+        const searchInput = document.getElementById('search-input');
+        const mapContainer = document.getElementById('map');
+
+        if (currentMode === 'entfernung') {
+            measureBox.style.display = 'block';
+            clearBtn.style.display = 'inline';
+
+            // Suche deaktivieren und Ort-Klicks sperren
+            searchInput.disabled = true;
+            mapContainer.classList.add('measuring-mode');
+        } else {
+            measureBox.style.display = 'none';
+            clearBtn.style.display = 'none';
+
+            // Suche wieder aktivieren und Orte wieder klickbar machen
+            searchInput.disabled = false;
+            mapContainer.classList.remove('measuring-mode');
+        }
+    }
+
+    // 5. Entfernungs-Messung Logik
+    function addMeasurePoint(latlng) {
+        measurePoints.push(latlng);
+
+        // Kleiner Punkt auf der Klick-Stelle
+        const pointMarker = L.circleMarker(latlng, {
+            radius: 4,
+            color: '#38bdf8',
+            fillColor: '#38bdf8',
+            fillOpacity: 1
+        }).addTo(map);
+        measureMarkers.push(pointMarker);
+
+        // Linie aufbauen / erweitern
+        if (measurePolyline) {
+            measurePolyline.setLatLngs(measurePoints);
+        } else {
+            measurePolyline = L.polyline(measurePoints, {
+                color: '#38bdf8',
+                weight: 3,
+                dashArray: '6, 6'
+            }).addTo(map);
+        }
+
+        // Gesamtdistanz berechnen (Euklidische Distanz in Bild-Pixeln)
+        let totalPixelDistance = 0;
+        for (let i = 0; i < measurePoints.length - 1; i++) {
+            const p1 = measurePoints[i];
+            const p2 = measurePoints[i+1];
+            const dy = p2.lat - p1.lat;
+            const dx = p2.lng - p1.lng;
+            totalPixelDistance += Math.sqrt(dx * dx + dy * dy);
+        }
+
+        const miles = totalPixelDistance / PIXELS_PER_MILE;
+        const km = miles * MILES_TO_KM;
+
+        document.getElementById('dist-mi').innerText = miles.toFixed(1);
+        document.getElementById('dist-km').innerText = km.toFixed(1);
+    }
+
+    function clearMeasurement() {
+        measurePoints = [];
+        if (measurePolyline) {
+            map.removeLayer(measurePolyline);
+            measurePolyline = null;
+        }
+        measureMarkers.forEach(m => map.removeLayer(m));
+        measureMarkers = [];
+        document.getElementById('dist-mi').innerText = '0';
+        document.getElementById('dist-km').innerText = '0';
+    }
+
+    // 6. Zentraler Klick-Handler je nach aktivem Modus
+    map.on('click', function(e) {
+        if (currentMode === 'ort') {
+            // Ort hinzufügen
+            const cityName = prompt("Name der neuen Stadt/des neuen Ortspunkts:");
+            if (!cityName || !cityName.trim()) return;
+
+            const newLocation = {
+                id: Date.now(),
+                name: cityName.trim(),
+                date: new Date().toISOString().split('T')[0],
+                info: '',
+                coords: [Math.round(e.latlng.lat), Math.round(e.latlng.lng)]
+            };
+
+            locations.push(newLocation);
+            saveLocationsToStorage();
+            renderAll();
+
+            const newMarkerEntry = markers[newLocation.name.toLowerCase()];
+            if (newMarkerEntry) {
+                newMarkerEntry.marker.openPopup();
+            }
+        } else if (currentMode === 'entfernung') {
+            // Messpunkt setzen
+            addMeasurePoint(e.latlng);
+        }
+        // Im 'default' Modus passiert beim Klick auf freie Stellen nichts
+    });
+
+    // 7. Hilfsfunktionen (Speichern, Löschen, Suche, Reset)
+    window.saveData = function(id) {
+        const loc = locations.find(l => l.id === id);
+        if (loc) {
+            loc.date = document.getElementById(`date-${id}`).value;
+            loc.info = document.getElementById(`info-${id}`).value;
+            saveLocationsToStorage();
+            alert(`Änderungen für "${loc.name}" gespeichert!`);
+        }
+    };
+
+    window.deleteLocation = function(id) {
+        if (confirm("Möchtest du diesen Ort wirklich löschen?")) {
+            locations = locations.filter(l => l.id !== id);
+            saveLocationsToStorage();
+            renderAll();
+        }
+    };
+
+    window.searchLocation = function() {
+        const query = document.getElementById('search-input').value.trim().toLowerCase();
+        const match = markers[query];
+
+        if (match) {
+            map.flyTo(match.data.coords, 1, { duration: 1.5 });
+            setTimeout(() => { match.marker.openPopup(); }, 1200);
+        } else {
+            alert('Stadt nicht gefunden!');
+        }
+    };
+
+
+    document.getElementById('search-input').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') searchLocation();
+    });
+
+    // Öffnet das Dropdown automatisch und leert das Feld beim Anklicken
+    function prepareSearch(input) {
+        input.value = ''; // Alter Name wird sofort gelöscht
+        if (typeof input.showPicker === 'function') {
+            try {
+                input.showPicker(); // Öffnet das Dropdown-Menü im Browser
+            } catch (e) {
+                // Fallback für ältere Browser
+            }
+        }
+    }
+
+    // Optional: Direkt zum Ort springen, sobald man ihn im Dropdown anklickt
+    document.getElementById('search-input').addEventListener('change', function() {
+        if (this.value) searchLocation();
+    });
+
+    // Start
+    renderAll();
+</script>
+</body>
+</html>
